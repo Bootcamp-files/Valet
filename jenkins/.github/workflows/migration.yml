@@ -1,0 +1,360 @@
+# Version 1.0.2
+name: Migrate Jenkins Job
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created]
+
+env:
+  jenkinsUrlPattern: "Jenkins Job URL:"
+  ghRepoUrlPattern: "GitHub Repository URL:"
+  pullRequestPattern: "Pull request:"
+  outputDirName: __output
+  VALET_REGISTRY: ghcr.io
+
+jobs:
+  prepare:
+    name: Read Config
+    runs-on: ubuntu-latest
+    outputs:
+      jenkinsUrl: ${{ steps.readConfig.outputs.jenkinsUrl }}
+      repoUrl: ${{ steps.readConfig.outputs.repoUrl }}
+
+    steps:
+      - name: extract data
+        id: readConfig
+        run: |
+          jenkinsUrl=$(echo -n "$issue_body" | grep '${{ env.jenkinsUrlPattern }}' | sed 's/${{ env.jenkinsUrlPattern }}//gi' | sed 's/^[ \t]*//;s/[ \t\n\r]*$//')
+          repoUrl=$(echo -n "$issue_body" | grep '${{ env.ghRepoUrlPattern }}' | sed 's/${{ env.ghRepoUrlPattern }}//gi' | sed 's/^[ \t]*//;s/[ \t\n\r]*$//')
+          echo DBG $jenkinsUrl to $repoUrl
+          echo "::set-output name=jenkinsUrl::$jenkinsUrl"
+          echo "::set-output name=repoUrl::$repoUrl"
+        shell: bash
+        env:
+          issue_body: ${{ github.event.issue.body }}
+
+      - name: Show error and fail workflow
+        if: steps.readConfig.outputs.jenkinsUrl == '' || steps.readConfig.outputs.repoUrl == ''
+        uses: actions/github-script@v3
+        with:
+          script: |
+            const body = `:x: **Error**
+
+            The provided data is not in the correct format. Ensure the issue body contains the required information in the following format:
+
+            \`\`\`
+            ${{ env.jenkinsUrlPattern }}
+            ${{ env.ghRepoUrlPattern }}
+            \`\`\`
+
+            This is what I understood
+            ${{ env.jenkinsUrlPattern }} ${{ steps.readConfig.outputs.jenkinsUrl }}
+            ${{ env.ghRepoUrlPattern }} ${{ steps.readConfig.outputs.repoUrl }}
+
+            Please edit the issue with the required information to continue.
+            `
+            await github.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            })
+
+            process.exit(1)
+
+      - name: ACK prepare and send instructions
+        uses: actions/github-script@v3
+        with:
+          script: |
+            const body = `👋 Thank you for opening this migration issue.
+
+            We are going to migrate jenkins job at ${{ steps.readConfig.outputs.jenkinsUrl }} to GitHub repo at ${{ steps.readConfig.outputs.repoUrl }}
+            once you tell us to do it, via an command.
+
+            For your convenience we are doing a dry-run migration automatically (stay put, it shouldn't take long :rocket:)
+
+            You can enter a command by adding a comment to this issue.
+
+            Commands available:
+
+            - \`/run-dry-run\`: used to perform a dry-run migration. The transformed workflow will be added as a comment to this issue.
+            - \`/run-migration\`: used to perform a production migration. The transformed workflow will be used to create a PR in the target repository. This workflow can be edited as necessary before the PR is merged.
+            `
+
+            await github.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            })
+
+            await github.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['Ready']
+            })
+
+  dry-run:
+    name: Dry Run
+    runs-on: ubuntu-latest
+
+    needs: prepare
+
+    if: (
+      github.event_name == 'issues' &&
+      (github.event.action == 'opened' || github.event.action == 'edited')
+      ) ||
+      (github.event_name == 'issue_comment' && github.event.comment.body == '/run-dry-run')
+
+    steps:
+      - uses: actions/checkout@v2
+        name: checkout
+
+      - name: login acr
+        run: docker login -u ${{ secrets.GHCR_LOGIN }} -p ${{ secrets.GHCR_VALET_PASSWORD }} ${{ env.VALET_REGISTRY}}
+
+      - name: dry run
+        run: |
+          sudo chmod 755 scripts/valet
+          dry_run_path='${{ env.outputDirName }}'
+          sudo rm -rf $dry_run_path
+          mkdir -p $dry_run_path
+
+          dry_run_path_files_list="$dry_run_path/yaml_files.txt"
+          echo dry-run for ${{ needs.prepare.outputs.jenkinsUrl }}
+          DOCKER_OPTIONS= scripts/valet dry-run jenkins --source-url '${{ needs.prepare.outputs.jenkinsUrl }}' --output-dir "/data/$dry_run_path" >> output.txt 2>&1
+
+          find "$dry_run_path" -name '*.yml' > $dry_run_path_files_list
+          echo "DRY_RUN_FILE_LIST=$dry_run_path_files_list" >> $GITHUB_ENV
+          cat $dry_run_path_files_list
+        env:
+          JENKINSFILE_ACCESS_TOKEN: ${{ secrets.JENKINSFILE_ACCESS_TOKEN }}
+          JENKINS_USERNAME: ${{ secrets.JENKINS_USERNAME }}
+          JENKINS_ACCESS_TOKEN: ${{ secrets.JENKINS_ACCESS_TOKEN }}
+          JENKINS_INSTANCE_URL: ${{ secrets.JENKINS_INSTANCE_URL }}
+          GITHUB_INSTANCE_URL: ${{ secrets.GH_INSTANCE_URL }}
+          TERM: VT220
+
+      - name: Report Failure
+        if: ${{ failure() }}
+        uses: actions/github-script@v3
+        with:
+          script: |
+            const fs = require('fs')
+            const path = require('path');
+
+            const logsDir = "${{ env.outputDirName }}/log"
+
+            let logFileName = 'output.txt'
+            try {
+              const files = fs.readdirSync(logsDir).sort((first,second) => {
+                return fs.statSync(path.join(logsDir, first)).ctime > fs.statSync(path.join(logsDir, second)).ctime ? -1 : 1
+              })
+
+              if (files && files.length > 0) logFileName = path.join(logsDir,files[0])
+            } catch {}
+
+            let output = ""
+            try {
+              console.log("using logfile " + logFileName)
+              output = fs.readFileSync(logFileName)
+            } catch {}
+
+            let body = `# dry run execution log
+
+            Execution failed for ${{ needs.prepare.outputs.jenkinsUrl }}:
+
+            \`\`\`
+            ${output}
+            \`\`\`
+            `
+
+            await github.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            })
+
+      - name: send dry run results
+        uses: actions/github-script@v3
+        with:
+          script: |
+            const fs = require('fs')
+            const path = require('path');
+
+            const logsDir = "${{ env.outputDirName }}/log"
+
+            let logFileName = 'output.txt'
+
+            try {
+              const files = fs.readdirSync(logsDir).sort((first,second) => {
+                return fs.statSync(path.join(logsDir, first)).ctime > fs.statSync(path.join(logsDir, second)).ctime ? -1 : 1
+              })
+
+              if (files && files.length > 0) logFileName = path.join(logsDir,files[0])
+            } catch {}
+
+            let output = ""
+            try {
+              output = fs.readFileSync(logFileName)
+            } catch {}
+
+            let body = `# dry run execution log
+
+            workflow(s) will be placed in the next comment(s) for convenience.
+
+            \`\`\`
+            ${output}
+            \`\`\`
+            `
+
+            await github.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            })
+
+            files_list = fs.readFileSync("${{ env.DRY_RUN_FILE_LIST}}")
+
+            files = files_list.toString().split("\n")
+
+            for(var x=0; x < files.length; x++) {
+                const dry_run_file = files[x]
+
+                if( dry_run_file === "") continue
+
+                console.log("Publishing " + dry_run_file)
+
+                yaml = fs.readFileSync(dry_run_file)
+                body = `
+            \`\`\`YAML
+            ${yaml}
+            \`\`\`
+                `
+
+                await github.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body
+                })
+
+            }
+
+            body = `:boom: If you are satisfied with this worklow, the \`/run-migration\` command can be used to migrate this workflow to the target repository.
+
+            Additional dry-run migrations can be run using the \`/run-dry-run\` command.
+            `
+
+            await github.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            })
+
+  migrate:
+    name: Migrate
+    runs-on: ubuntu-latest
+
+    needs: prepare
+
+    if: github.event_name == 'issue_comment' &&
+      github.event.comment.body == '/run-migration'
+
+    steps:
+      - uses: actions/checkout@v2
+        name: checkout
+
+      - name: login acr
+        run: docker login -u  ${{ secrets.GHCR_LOGIN }} -p ${{ secrets.GHCR_VALET_PASSWORD}} ${{ env.VALET_REGISTRY}}
+
+      - name: migrate
+        run: |
+          sudo chmod 755 scripts/valet
+          echo running migration for ${{ needs.prepare.outputs.jenkinsUrl }}
+          sudo rm -rf ${{ env.outputDirName }}
+          DOCKER_OPTIONS= scripts/valet migrate jenkins \
+            --source-url "${{ needs.prepare.outputs.jenkinsUrl }}" \
+            --target-url "${{ needs.prepare.outputs.repoUrl }}" \
+            --output-dir '/data/${{ env.outputDirName }}' >> output.txt 2>&1
+        env:
+          JENKINSFILE_ACCESS_TOKEN: ${{ secrets.JENKINSFILE_ACCESS_TOKEN }}
+          JENKINS_USERNAME: ${{ secrets.JENKINS_USERNAME }}
+          JENKINS_ACCESS_TOKEN: ${{ secrets.JENKINS_ACCESS_TOKEN }}
+          JENKINS_INSTANCE_URL: ${{ secrets.JENKINS_INSTANCE_URL }}
+          GITHUB_ACCESS_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+          GITHUB_INSTANCE_URL: ${{ secrets.GH_INSTANCE_URL }}
+          TERM: VT220
+
+      - name: Get PR URL
+        run: |
+          createdPullRequest=$(grep '${{ env.pullRequestPattern}}' output.txt | sed 's/.*${{ env.pullRequestPattern }}//gi' | sed 's/^[ \t]*//;s/[ \t\n\r]*$//')
+          echo "createdPullRequestUrl=$createdPullRequest" >> $GITHUB_ENV
+
+      - name: Report Result
+        if: ${{ always() }}
+        uses: actions/github-script@v3
+        with:
+          script: |
+            const fs = require('fs')
+            const path = require('path');
+
+            const logsDir = "${{ env.outputDirName }}/log"
+
+            let logFileName = 'output.txt'
+            try {
+              const files = fs.readdirSync(logsDir).sort((first,second) => {
+                return fs.statSync(path.join(logsDir, first)).ctime > fs.statSync(path.join(logsDir, second)).ctime ? -1 : 1
+              })
+
+              if (files && files.length > 0) logFileName = path.join(logsDir,files[0])
+            } catch {}
+
+            let output = ""
+            try {
+              console.log("using logfile " + logFileName)
+              output = fs.readFileSync(logFileName)
+            } catch {}
+
+
+            let createdPRText=""
+            if (process.env.createdPullRequestUrl) {
+              prUrl = process.env.createdPullRequestUrl.replace(/^'/,"").replace(/'$/,"")
+              createdPRText = `The [Pull Request](${prUrl}) has been created with the migrated workflow`
+            }
+
+            let body = `# migration execution log
+
+            Execution result from ${{ needs.prepare.outputs.jenkinsUrl }} to [repo](${{ needs.prepare.outputs.repoUrl}})
+
+            ${createdPRText}
+
+            \`\`\`
+            ${output}
+            \`\`\`
+            `
+
+            github.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            })
+
+      - name: Add migrated Label
+        uses: actions/github-script@v3
+        with:
+          script: |
+
+            github.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['Migrated']
+            })
